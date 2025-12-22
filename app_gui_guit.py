@@ -13,18 +13,11 @@ from reportlab.lib import colors
 import io
 
 # --- 1. 設定 ---
-# 【重要】ここにAPIキーを入れてください
-#API_KEY = "APIキー" 
 api_key = st.secrets["OPENAI_API_KEY"]
-#client = OpenAI(api_key=API_KEY)
-
-
 client = OpenAI(api_key=api_key)
 
 # --- 2. AI関数 ---
 def generate_recipe_json(ingredients, mode, condition, target, user_message):
-    
-    # プロンプト：モードと条件を両方反映させるように修正
     prompt = f"""
     あなたは「調理工程の効率化」に特化したプロの料理研究家です。
     ユーザーは「{target}」へのプレゼントとしてレシピを作りたいと考えています。
@@ -59,7 +52,7 @@ def generate_recipe_json(ingredients, mode, condition, target, user_message):
     )
     return json.loads(response.choices[0].message.content)
 
-# --- 3. PDF生成関数（修正：宛名とメッセージを引数で受け取る） ---
+# --- 3. PDF生成関数 ---
 def create_pdf_bytes(data, target_name, user_message_content):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
@@ -78,27 +71,20 @@ def create_pdf_bytes(data, target_name, user_message_content):
     title_style = ParagraphStyle(name='TitleJp', fontName='JapaneseFont', fontSize=24, leading=30, alignment=1, spaceAfter=20)
     heading_style = ParagraphStyle(name='HeadingJp', fontName='JapaneseFont', fontSize=16, leading=20, spaceBefore=15, spaceAfter=10, textColor=colors.darkgreen)
     body_style = ParagraphStyle(name='BodyJp', fontName='JapaneseFont', fontSize=12, leading=18)
-    # メッセージ欄のデザイン
     message_style = ParagraphStyle(name='MsgJp', fontName='JapaneseFont', fontSize=14, leading=22, backColor=colors.lightyellow, borderColor=colors.orange, borderWidth=1, splitLongWords=1, spaceBefore=10, spaceAfter=10, borderPadding=10)
 
     story = []
 
-    # タイトル
     story.append(Paragraph(data['title'], title_style))
-    
-    # ★修正箇所：宛名を正しく表示
     story.append(Paragraph(f"For: {target_name}", heading_style))
-    
     story.append(Paragraph(f"調理時間: {data['cooking_time']}", body_style))
     story.append(Spacer(1, 5*mm))
 
-    # ★修正箇所：メッセージ欄（ユーザー入力をそのまま表示）
     if user_message_content:
         story.append(Paragraph("Message:", heading_style))
         story.append(Paragraph(user_message_content, message_style))
         story.append(Spacer(1, 5*mm))
 
-    # 材料表
     story.append(Paragraph("■ 材料", heading_style))
     ing_data = [[item['name'], item['amount']] for item in data['ingredients']]
     t = Table(ing_data, colWidths=[100*mm, 50*mm])
@@ -110,12 +96,10 @@ def create_pdf_bytes(data, target_name, user_message_content):
     ]))
     story.append(t)
 
-    # 下準備
     story.append(Paragraph("■ 下準備 (Mise en place)", heading_style))
     for i, prep in enumerate(data['preparation'], 1):
         story.append(Paragraph(f"{i}. {prep}", body_style))
     
-    # 工程
     story.append(Paragraph("■ 作り方", heading_style))
     for i, step in enumerate(data['steps'], 1):
         story.append(Paragraph(f"Step {i}: {step}", body_style))
@@ -132,19 +116,10 @@ def main():
     with st.sidebar:
         st.header("入力情報")
         ingredients = st.text_area("食材リスト", "豚肉、余ったキャベツ、卵1個")
-        
-        # 誰宛か
         target = st.text_input("誰のために作りますか？（宛名）", "妻へ")
-        
-        # モード選択
         mode = st.selectbox("買い物モード", ["家にあるもので意地でも作る", "買い物OK！豪華にする"])
-        
-        # ★復活させた条件入力欄
         condition = st.text_input("その他の条件・味の好み", "ガッツリ系、ニンニク多め、辛いのOK")
-        
-        # メッセージ
         user_message = st.text_area("添えるメッセージ", "いつもありがとう！今日は僕が作ります。")
-        
         generate_btn = st.button("レシピを生成する！")
 
     if generate_btn:
@@ -152,15 +127,46 @@ def main():
             # 1. AI生成
             recipe_data = generate_recipe_json(ingredients, mode, condition, target, user_message)
             
-            # 2. プレビュー
-            st.success(f"完成しました！：{recipe_data['title']}")
+            # --- 2. 画面への表示 (新機能) ---
+            st.markdown("---") # 区切り線
             
-            # 3. PDF生成（宛名とメッセージを直接渡す）
+            # タイトルと宛名
+            st.title(recipe_data['title'])
+            st.subheader(f"For: {target}")
+            st.write(f"⏱️ **調理時間:** {recipe_data['cooking_time']}")
+
+            # メッセージ（ある場合のみ）
+            if user_message:
+                st.info(f"💌 **Message:**\n\n{user_message}")
+
+            # 材料リスト
+            st.header("🛒 材料")
+            for item in recipe_data['ingredients']:
+                st.write(f"- **{item['name']}**: {item['amount']}")
+
+            # 下準備
+            st.header("🔪 下準備")
+            for i, prep in enumerate(recipe_data['preparation'], 1):
+                st.write(f"{i}. {prep}")
+
+            # 作り方
+            st.header("🔥 作り方")
+            for i, step in enumerate(recipe_data['steps'], 1):
+                st.write(f"Step {i}: {step}")
+
+            # シェフのアドバイス
+            if 'chef_comment' in recipe_data:
+                st.success(f"👨‍🍳 **シェフのアドバイス:**\n{recipe_data['chef_comment']}")
+
+            st.markdown("---")
+            # -------------------------------
+
+            # 3. PDF生成 & ダウンロードボタン
             pdf_bytes = create_pdf_bytes(recipe_data, target, user_message)
             
             if pdf_bytes:
                 st.download_button(
-                    label="📄 レシピPDFをダウンロード",
+                    label="📄 このレシピのPDFをダウンロード",
                     data=pdf_bytes,
                     file_name="recipe_gift.pdf",
                     mime="application/pdf"
