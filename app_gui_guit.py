@@ -1,5 +1,6 @@
 import streamlit as st
 import json
+import io
 from openai import OpenAI
 from supabase import create_client, Client
 from reportlab.pdfgen import canvas
@@ -10,40 +11,64 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
-import io
 
 # --- 1. 設定 & DB接続 ---
-# APIキーの取得
 openai_api_key = st.secrets["OPENAI_API_KEY"]
 supabase_url = st.secrets["SUPABASE_URL"]
 supabase_key = st.secrets["SUPABASE_KEY"]
 
-# クライアントの初期化
 client = OpenAI(api_key=openai_api_key)
 supabase: Client = create_client(supabase_url, supabase_key)
 
 # テーマカラー
 PRIMARY_COLOR = colors.HexColor("#E67E22")
-ACCENT_COLOR = colors.HexColor("#FDEBD0")
 TEXT_COLOR = colors.HexColor("#2C3E50")
 
-# --- 2. AI関数 ---
-def generate_recipe_json(ingredients, mode, condition, target, user_message):
+# --- 2. 認証関係の関数 (新機能) ---
+def init_session():
+    """セッションの初期化"""
+    if 'user' not in st.session_state:
+        st.session_state['user'] = None
+
+def login_user(email, password):
+    """ログイン処理"""
+    try:
+        response = supabase.auth.sign_in_with_password({"email": email, "password": password})
+        st.session_state['user'] = response.user
+        st.success("ログインしました！")
+        st.rerun()
+    except Exception as e:
+        st.error(f"ログインエラー: メールアドレスかパスワードが間違っています。")
+
+def signup_user(email, password):
+    """新規登録処理"""
+    try:
+        response = supabase.auth.sign_up({"email": email, "password": password})
+        st.session_state['user'] = response.user
+        st.success("アカウント作成成功！自動的にログインします。")
+        st.rerun()
+    except Exception as e:
+        st.error(f"登録エラー: {e}")
+
+def logout_user():
+    """ログアウト処理"""
+    supabase.auth.sign_out()
+    st.session_state['user'] = None
+    st.rerun()
+
+# --- 3. アプリのメイン機能（AI & DB） ---
+
+def generate_recipe_json(ingredients, mode, condition, user_message):
     prompt = f"""
     あなたは「自炊効率化のプロ」です。
     ユーザーは自分用に、手軽で美味しい料理を作りたいと考えています。
     以下の情報を元に、指定のJSON形式のみを出力してください。
-
+    
     【ユーザー入力】
     * 食材: {ingredients}
     * モード: {mode}
     * 条件: {condition}
     * メモ: {user_message}
-
-    【重要ルール】
-    1. 材料リストには調味料とその分量も必ず網羅すること。
-    2. 手順は「考えずに動ける」くらい具体的に。
-    3. JSONのみ出力。
 
     【出力フォーマット(JSON)】
     {{
@@ -52,7 +77,7 @@ def generate_recipe_json(ingredients, mode, condition, target, user_message):
       "ingredients": [ {{"name": "食材名", "amount": "分量"}} ],
       "preparation": [ "下準備1", "下準備2" ],
       "steps": [ "工程1", "工程2" ],
-      "chef_comment": "コツ・ポイント"
+      "chef_comment": "コツ"
     }}
     """
     response = client.chat.completions.create(
@@ -62,13 +87,13 @@ def generate_recipe_json(ingredients, mode, condition, target, user_message):
     )
     return json.loads(response.choices[0].message.content)
 
-# --- 3. データベース操作関数 ---
-def save_recipe_to_db(recipe_data, user_comment=""):
-    """レシピをSupabaseに保存する"""
+def save_recipe_to_db(recipe_data, user_comment, user_id):
+    """レシピを保存（ユーザーID付き）"""
     try:
         data = {
+            "user_id": user_id,  # 誰のデータか記録
             "title": recipe_data["title"],
-            "content": recipe_data, # JSONデータをそのまま保存
+            "content": recipe_data,
             "comment": user_comment
         }
         supabase.table("recipes").insert(data).execute()
@@ -77,139 +102,136 @@ def save_recipe_to_db(recipe_data, user_comment=""):
         st.error(f"保存エラー: {e}")
         return False
 
-def get_recent_recipes():
-    """最近保存したレシピを取得する"""
+def get_my_recipes(user_id):
+    """自分のレシピだけを取得"""
     try:
-        response = supabase.table("recipes").select("*").order("created_at", desc=True).limit(5).execute()
+        # .eq("user_id", user_id) で自分のデータだけフィルターする
+        response = supabase.table("recipes").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
         return response.data
     except Exception as e:
         return []
 
-# --- 4. PDF生成関数 (簡略化版) ---
+# PDF生成関数（簡略版）
 def create_pdf_bytes(data):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-                            rightMargin=20*mm, leftMargin=20*mm,
-                            topMargin=20*mm, bottomMargin=25*mm)
-    
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
     font_path = "ipaexg.ttf" 
     try:
         pdfmetrics.registerFont(TTFont('JapaneseFont', font_path))
     except:
         return None
-
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(name='TitleJp', fontName='JapaneseFont', fontSize=24, leading=30, alignment=1, spaceAfter=10, textColor=PRIMARY_COLOR)
-    heading_style = ParagraphStyle(name='HeadingJp', fontName='JapaneseFont', fontSize=16, leading=20, spaceBefore=15, spaceAfter=10, textColor=TEXT_COLOR)
-    body_style = ParagraphStyle(name='BodyJp', fontName='JapaneseFont', fontSize=11, leading=16, textColor=TEXT_COLOR)
-
-    story = []
-    story.append(Paragraph(data['title'], title_style))
-    story.append(Paragraph(f"⏱ {data['cooking_time']}", heading_style))
-    
-    story.append(Paragraph("🛒 材料", heading_style))
-    ing_data = []
+    story = [Paragraph(data['title'], ParagraphStyle(name='Title', fontName='JapaneseFont', fontSize=20))]
+    story.append(Spacer(1, 5*mm))
+    story.append(Paragraph("■材料", ParagraphStyle(name='H1', fontName='JapaneseFont', fontSize=14)))
     for item in data['ingredients']:
-        ing_data.append([item['name'], item['amount']])
-    t_ing = Table(ing_data, colWidths=[100*mm, 40*mm])
-    t_ing.setStyle(TableStyle([
-        ('FONT', (0, 0), (-1, -1), 'JapaneseFont', 11),
-        ('TEXTCOLOR', (0, 0), (-1, -1), TEXT_COLOR),
-        ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.lightgrey),
-        ('PADDING', (0, 0), (-1, -1), 6),
-    ]))
-    story.append(t_ing)
-
-    story.append(Paragraph("🍳 作り方", heading_style))
+        story.append(Paragraph(f"・{item['name']} : {item['amount']}", ParagraphStyle(name='Body', fontName='JapaneseFont')))
+    story.append(Spacer(1, 5*mm))
+    story.append(Paragraph("■作り方", ParagraphStyle(name='H1', fontName='JapaneseFont', fontSize=14)))
     for i, step in enumerate(data['steps'], 1):
-        story.append(Paragraph(f"Step {i}: {step}", body_style))
-
+        story.append(Paragraph(f"{i}. {step}", ParagraphStyle(name='Body', fontName='JapaneseFont')))
     doc.build(story)
     buffer.seek(0)
     return buffer
 
-# --- 5. Streamlit 画面 ---
+# --- 4. 画面制御（メイン） ---
 def main():
     st.set_page_config(page_title="My Recipe Log", page_icon="🍳")
-    st.title("🍳 自炊サポート & レシピログ")
+    init_session()
 
-    # タブで機能を分ける
-    tab1, tab2 = st.tabs(["📝 レシピ作成", "📚 保存したレシピ一覧"])
-
-    # --- タブ1: レシピ生成 ---
-    with tab1:
-        st.markdown("冷蔵庫の余り物で、**自分だけの効率化レシピ**を作りましょう。")
+    # --- ログインしていない時 ---
+    if st.session_state['user'] is None:
+        st.title("🍳 Recipe Log - ログイン")
+        st.markdown("自分だけのレシピ帳を作るには、ログインしてください。")
         
+        tab1, tab2 = st.tabs(["ログイン", "新規登録"])
+        
+        with tab1:
+            email = st.text_input("メールアドレス", key="login_email")
+            password = st.text_input("パスワード", type="password", key="login_pass")
+            if st.button("ログイン", type="primary"):
+                login_user(email, password)
+        
+        with tab2:
+            st.warning("※現在はテスト運用のめ、適当なメールアドレスでも登録できます。")
+            new_email = st.text_input("メールアドレス", key="signup_email")
+            new_password = st.text_input("パスワード（6文字以上）", type="password", key="signup_pass")
+            if st.button("アカウント作成"):
+                signup_user(new_email, new_password)
+        
+        return  # ここで処理を止める（メイン画面を見せない）
+
+    # --- ログインしている時（メインアプリ） ---
+    
+    # サイドバーにユーザー情報とログアウトボタン
+    with st.sidebar:
+        st.write(f"ログイン中: {st.session_state['user'].email}")
+        if st.button("ログアウト"):
+            logout_user()
+
+    st.title("🍳 自炊サポート & ログ")
+    
+    tab_create, tab_log = st.tabs(["📝 レシピ作成", "📚 自分のレシピ帳"])
+
+    # タブ1: レシピ作成
+    with tab_create:
         col1, col2 = st.columns([1, 2])
         with col1:
-            ingredients = st.text_area("食材リスト", "豚肉、玉ねぎ、卵")
-            mode = st.selectbox("モード", ["手早く済ませたい", "ガッツリ食べたい"])
-            condition = st.text_input("条件", "洗い物を減らしたい")
-            user_message = st.text_area("自分へのメモ", "明日のお弁当にも入れたい")
-            generate_btn = st.button("🍳 レシピを考案", type="primary")
-
+            ingredients = st.text_area("食材", "豚肉、玉ねぎ")
+            mode = st.selectbox("モード", ["手早く", "ガッツリ"])
+            condition = st.text_input("条件", "洗い物少なく")
+            user_message = st.text_area("メモ", "お弁当用")
+            if st.button("レシピ考案", type="primary"):
+                with st.spinner("AI思考中..."):
+                    recipe = generate_recipe_json(ingredients, mode, condition, user_message)
+                    st.session_state['current_recipe'] = recipe
+        
         with col2:
-            if generate_btn:
-                with st.spinner("AIがレシピを構築中..."):
-                    # 生成
-                    recipe_data = generate_recipe_json(ingredients, mode, condition, "自分", user_message)
-                    
-                    # セッション状態に保存（ボタンを押しても消えないように）
-                    st.session_state['current_recipe'] = recipe_data
-                    st.session_state['generated'] = True
-
-            # レシピ表示部分
-            if 'generated' in st.session_state and st.session_state['generated']:
-                recipe = st.session_state['current_recipe']
+            if 'current_recipe' in st.session_state:
+                r = st.session_state['current_recipe']
+                st.subheader(r['title'])
+                st.write(f"⏱ {r['cooking_time']}")
                 
-                st.subheader(f"🍽️ {recipe['title']}")
-                st.write(f"⏱ **時間:** {recipe['cooking_time']}")
-                st.info(f"💡 **Point:** {recipe.get('chef_comment', '')}")
-
-                # 材料と手順
-                st.write("---")
-                st.write("**🛒 材料:**")
-                for item in recipe['ingredients']:
-                    st.write(f"- {item['name']}: {item['amount']}")
+                # 材料表示
+                st.write("**🛒 材料**")
+                for i in r['ingredients']: st.write(f"- {i['name']} {i['amount']}")
                 
-                st.write("**🍳 手順:**")
-                for i, step in enumerate(recipe['steps'], 1):
-                    st.write(f"{i}. {step}")
-                
-                st.write("---")
-                
-                # --- 保存ボタン ---
-                if st.button("💾 このレシピをログに保存する"):
-                    if save_recipe_to_db(recipe, user_message):
-                        st.success("✅ レシピをデータベースに保存しました！「保存したレシピ一覧」タブで確認できます。")
-                    else:
-                        st.error("保存に失敗しました。")
+                # 手順表示
+                st.write("**🍳 手順**")
+                for idx, s in enumerate(r['steps'], 1): st.write(f"{idx}. {s}")
 
-                # PDFダウンロード
-                pdf_bytes = create_pdf_bytes(recipe)
-                if pdf_bytes:
-                    st.download_button("📄 PDFで保存", pdf_bytes, "recipe.pdf", "application/pdf")
+                st.markdown("---")
+                # 保存ボタン（ユーザーIDを渡す！）
+                if st.button("💾 自分のログに保存"):
+                    user_id = st.session_state['user'].id
+                    if save_recipe_to_db(r, user_message, user_id):
+                        st.success("保存しました！")
+                
+                # PDF
+                pdf = create_pdf_bytes(r)
+                if pdf: st.download_button("PDF保存", pdf, "recipe.pdf", "application/pdf")
 
-    # --- タブ2: ログ閲覧 ---
-    with tab2:
-        st.header("📚 過去のレシピログ")
-        if st.button("🔄 更新"):
-            st.rerun()
-            
-        recipes = get_recent_recipes()
-        if recipes:
-            for r in recipes:
-                with st.expander(f"{r['created_at'][:10]} : {r['title']}"):
-                    st.write(f"**メモ:** {r['comment']}")
-                    # JSONの中身を展開して表示
-                    content = r['content']
-                    st.write("**材料:**")
-                    for item in content.get('ingredients', []):
-                        st.write(f"- {item['name']}: {item['amount']}")
+    # タブ2: ログ閲覧（自分のデータだけ！）
+    with tab_log:
+        st.header("📚 あなたの料理ログ")
+        if st.button("更新"): st.rerun()
+        
+        # 自分のIDでフィルタリングして取得
+        user_id = st.session_state['user'].id
+        my_recipes = get_my_recipes(user_id)
+        
+        if my_recipes:
+            for r in my_recipes:
+                # 日付変換
+                date_str = r['created_at'].split('T')[0]
+                with st.expander(f"{date_str} : {r['title']}"):
+                    st.write(f"メモ: {r['comment']}")
+                    st.json(r['content']) # 詳細データ
         else:
-            st.info("まだ保存されたレシピはありません。")
+            st.info("保存されたレシピはまだありません。")
 
 if __name__ == "__main__":
     main()
+
 
 
