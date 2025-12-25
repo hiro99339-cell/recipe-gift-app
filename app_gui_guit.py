@@ -53,30 +53,15 @@ def logout_user():
     st.session_state['user'] = None
     st.rerun()
 
-# --- 3. 画像アップロード関数 (新機能) ---
+# --- 3. 画像アップロード関数 ---
 def upload_image(uploaded_file, user_id):
-    """画像をSupabase StorageにアップロードしてURLを返す"""
-    if uploaded_file is None:
-        return None
-    
+    if uploaded_file is None: return None
     try:
-        # ファイル名をユニークにする（user_id + uuid + 元の拡張子）
         file_ext = uploaded_file.name.split('.')[-1]
         file_name = f"{user_id}/{str(uuid.uuid4())}.{file_ext}"
-        
-        # バイトデータを取得
         file_bytes = uploaded_file.getvalue()
-        
-        # Upload
-        supabase.storage.from_("recipe_images").upload(
-            file_name,
-            file_bytes,
-            {"content-type": uploaded_file.type}
-        )
-        
-        # 公開URLを取得
-        public_url = supabase.storage.from_("recipe_images").get_public_url(file_name)
-        return public_url
+        supabase.storage.from_("recipe_images").upload(file_name, file_bytes, {"content-type": uploaded_file.type})
+        return supabase.storage.from_("recipe_images").get_public_url(file_name)
     except Exception as e:
         st.error(f"画像アップロードエラー: {e}")
         return None
@@ -112,15 +97,16 @@ def generate_recipe_json(ingredients, mode, condition, user_message):
     )
     return json.loads(response.choices[0].message.content)
 
-def save_recipe_to_db(recipe_data, user_comment, user_id, image_url=None):
-    """レシピを保存（画像URL対応）"""
+def save_recipe_to_db(recipe_data, user_comment, user_id, image_url=None, is_public=False):
+    """レシピを保存（公開設定に対応）"""
     try:
         data = {
             "user_id": user_id,
             "title": recipe_data["title"],
             "content": recipe_data,
             "comment": user_comment,
-            "image_url": image_url # 画像URLも保存
+            "image_url": image_url,
+            "is_public": is_public # 公開フラグを追加
         }
         supabase.table("recipes").insert(data).execute()
         return True
@@ -129,21 +115,26 @@ def save_recipe_to_db(recipe_data, user_comment, user_id, image_url=None):
         return False
 
 def get_my_recipes(user_id):
+    """自分のレシピを取得"""
     try:
-        response = supabase.table("recipes").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-        return response.data
-    except Exception as e:
-        return []
+        return supabase.table("recipes").select("*").eq("user_id", user_id).order("created_at", desc=True).execute().data
+    except: return []
 
-# PDF生成 (画像対応)
+def get_public_recipes():
+    """【新機能】みんなの公開レシピを取得"""
+    try:
+        # is_public が true のものだけ持ってくる
+        return supabase.table("recipes").select("*").eq("is_public", True).order("created_at", desc=True).limit(20).execute().data
+    except: return []
+
+# PDF生成
 def create_pdf_bytes(data):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     font_path = "ipaexg.ttf" 
     try:
         pdfmetrics.registerFont(TTFont('JapaneseFont', font_path))
-    except:
-        return None
+    except: return None
     styles = getSampleStyleSheet()
     story = [Paragraph(data['title'], ParagraphStyle(name='Title', fontName='JapaneseFont', fontSize=20))]
     story.append(Spacer(1, 5*mm))
@@ -169,24 +160,22 @@ def main():
         with tab1:
             email = st.text_input("メールアドレス", key="l_mail")
             password = st.text_input("パスワード", type="password", key="l_pass")
-            if st.button("ログイン", type="primary"):
-                login_user(email, password)
+            if st.button("ログイン", type="primary"): login_user(email, password)
         with tab2:
             st.warning("テスト運用中です。")
             new_email = st.text_input("メールアドレス", key="s_mail")
             new_password = st.text_input("パスワード(6文字以上)", type="password", key="s_pass")
-            if st.button("アカウント作成"):
-                signup_user(new_email, new_password)
+            if st.button("アカウント作成"): signup_user(new_email, new_password)
         return
 
     # ログイン済みメイン画面
     with st.sidebar:
         st.write(f"User: {st.session_state['user'].email}")
-        if st.button("ログアウト"):
-            logout_user()
+        if st.button("ログアウト"): logout_user()
 
     st.title("🍳 自炊サポート & ログ")
-    tab_create, tab_log = st.tabs(["📝 レシピ作成", "📚 自分のレシピ帳"])
+    # タブを3つに増やしました
+    tab_create, tab_log, tab_public = st.tabs(["📝 レシピ作成", "📚 自分のレシピ帳", "🌏 みんなの広場"])
 
     # タブ1: レシピ作成
     with tab_create:
@@ -206,59 +195,92 @@ def main():
                 r = st.session_state['current_recipe']
                 st.subheader(r['title'])
                 st.write(f"⏱ {r['cooking_time']}")
-                
                 st.write("**🛒 材料**")
                 for i in r['ingredients']: st.write(f"- {i['name']} {i['amount']}")
-                
                 st.write("**🍳 手順**")
                 for idx, s in enumerate(r['steps'], 1): st.write(f"{idx}. {s}")
-
                 st.markdown("---")
-                st.write("### 📸 料理の写真を記録する")
                 
-                # 画像アップロード機能
-                uploaded_file = st.file_uploader("完成した料理の写真をアップロード", type=['jpg', 'png', 'jpeg'])
+                # 画像アップロード
+                st.write("### 📸 保存設定")
+                uploaded_file = st.file_uploader("完成写真（任意）", type=['jpg', 'png', 'jpeg'])
+                
+                # ★ここが変わりました：公開スイッチ
+                is_public_check = st.checkbox("みんなの広場に公開する（他のユーザーも見れるようになります）")
                 
                 if st.button("💾 ログに保存"):
                     user_id = st.session_state['user'].id
-                    
-                    # 画像アップロード処理
                     image_url = None
                     if uploaded_file:
                         with st.spinner("画像をアップロード中..."):
                             image_url = upload_image(uploaded_file, user_id)
                     
-                    # DB保存
-                    if save_recipe_to_db(r, user_message, user_id, image_url):
-                        st.success("画像付きで保存しました！")
-                
-                # PDF
+                    # 公開設定も含めて保存
+                    if save_recipe_to_db(r, user_message, user_id, image_url, is_public_check):
+                        if is_public_check:
+                            st.success("公開状態で保存しました！みんなに見てもらえます！")
+                        else:
+                            st.success("自分だけのログとして保存しました。")
+
                 pdf = create_pdf_bytes(r)
                 if pdf: st.download_button("PDF保存", pdf, "recipe.pdf", "application/pdf")
 
-    # タブ2: ログ閲覧
+    # タブ2: 自分のログ
     with tab_log:
         st.header("📚 あなたの料理ログ")
-        if st.button("更新"): st.rerun()
+        if st.button("更新", key="refresh_my"): st.rerun()
         
-        user_id = st.session_state['user'].id
-        my_recipes = get_my_recipes(user_id)
-        
+        my_recipes = get_my_recipes(st.session_state['user'].id)
         if my_recipes:
             for r in my_recipes:
                 date_str = r['created_at'].split('T')[0]
-                with st.expander(f"{date_str} : {r['title']}"):
-                    # 画像があれば表示
-                    if r.get('image_url'):
-                        st.image(r['image_url'], caption="作った料理", use_container_width=True)
-                    
+                status = "🌏 公開中" if r['is_public'] else "🔒 自分のみ"
+                with st.expander(f"{date_str} : {r['title']} ({status})"):
+                    if r.get('image_url'): st.image(r['image_url'], use_container_width=True)
                     st.write(f"**メモ:** {r['comment']}")
                     st.json(r['content'])
         else:
             st.info("保存されたレシピはまだありません。")
 
+    # タブ3: みんなの広場（新機能！）
+    with tab_public:
+        st.header("🌏 みんなのレシピ広場")
+        st.markdown("他のユーザーが公開した自炊記録です。今晩の献立の参考に！")
+        if st.button("更新", key="refresh_pub"): st.rerun()
+
+        public_recipes = get_public_recipes()
+        
+        # ギャラリー風に表示（2列レイアウト）
+        if public_recipes:
+            cols = st.columns(2) # 2列にする
+            for idx, r in enumerate(public_recipes):
+                with cols[idx % 2]: # 左右に振り分け
+                    with st.container(border=True): # 枠で囲む
+                        # 画像があれば表示
+                        if r.get('image_url'):
+                            st.image(r['image_url'], use_container_width=True)
+                        else:
+                            st.markdown("🍳 *No Image*")
+                        
+                        st.subheader(r['title'])
+                        st.caption(f"投稿日: {r['created_at'].split('T')[0]}")
+                        st.write(f"💬 {r['comment']}")
+                        
+                        # 中身を見るボタン（詳細展開）
+                        with st.expander("レシピを見る"):
+                            content = r['content']
+                            st.write("**材料:**")
+                            for item in content['ingredients']:
+                                st.write(f"- {item['name']} {item['amount']}")
+                            st.write("**手順:**")
+                            for i, s in enumerate(content['steps'], 1):
+                                st.write(f"{i}. {s}")
+        else:
+            st.info("まだ公開されたレシピはありません。あなたが最初の投稿者になりましょう！")
+
 if __name__ == "__main__":
     main()
+
 
 
 
