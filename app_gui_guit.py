@@ -2,6 +2,8 @@ import streamlit as st
 import json
 import io
 import uuid
+import datetime
+import calendar
 from openai import OpenAI
 from supabase import create_client, Client
 from reportlab.pdfgen import canvas
@@ -9,7 +11,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
@@ -53,7 +55,7 @@ def logout_user():
     st.session_state['user'] = None
     st.rerun()
 
-# --- 3. 画像アップロード関数 ---
+# --- 3. 画像・DB操作 ---
 def upload_image(uploaded_file, user_id):
     if uploaded_file is None: return None
     try:
@@ -62,25 +64,15 @@ def upload_image(uploaded_file, user_id):
         file_bytes = uploaded_file.getvalue()
         supabase.storage.from_("recipe_images").upload(file_name, file_bytes, {"content-type": uploaded_file.type})
         return supabase.storage.from_("recipe_images").get_public_url(file_name)
-    except Exception as e:
-        st.error(f"画像アップロードエラー: {e}")
-        return None
-
-# --- 4. メイン機能 ---
+    except Exception as e: return None
 
 def generate_recipe_json(ingredients, mode, condition, user_message):
     prompt = f"""
     あなたは「自炊効率化のプロ」です。
     ユーザーは自分用に、手軽で美味しい料理を作りたいと考えています。
     以下の情報を元に、指定のJSON形式のみを出力してください。
-    
-    【ユーザー入力】
-    * 食材: {ingredients}
-    * モード: {mode}
-    * 条件: {condition}
-    * メモ: {user_message}
-
-    【出力フォーマット(JSON)】
+    【ユーザー入力】食材:{ingredients}, モード:{mode}, 条件:{condition}, メモ:{user_message}
+    【出力JSON形式】
     {{
       "title": "料理名",
       "cooking_time": "目安時間",
@@ -98,7 +90,6 @@ def generate_recipe_json(ingredients, mode, condition, user_message):
     return json.loads(response.choices[0].message.content)
 
 def save_recipe_to_db(recipe_data, user_comment, user_id, image_url=None, is_public=False):
-    """レシピを保存（公開設定に対応）"""
     try:
         data = {
             "user_id": user_id,
@@ -106,7 +97,7 @@ def save_recipe_to_db(recipe_data, user_comment, user_id, image_url=None, is_pub
             "content": recipe_data,
             "comment": user_comment,
             "image_url": image_url,
-            "is_public": is_public # 公開フラグを追加
+            "is_public": is_public
         }
         supabase.table("recipes").insert(data).execute()
         return True
@@ -115,25 +106,80 @@ def save_recipe_to_db(recipe_data, user_comment, user_id, image_url=None, is_pub
         return False
 
 def get_my_recipes(user_id):
-    """自分のレシピを取得"""
     try:
+        # 全件取得（カレンダー用）
         return supabase.table("recipes").select("*").eq("user_id", user_id).order("created_at", desc=True).execute().data
     except: return []
 
 def get_public_recipes():
-    """【新機能】みんなの公開レシピを取得"""
     try:
-        # is_public が true のものだけ持ってくる
         return supabase.table("recipes").select("*").eq("is_public", True).order("created_at", desc=True).limit(20).execute().data
     except: return []
+
+# --- 4. カレンダー・集計機能（新機能） ---
+def display_stats_and_calendar(recipes):
+    """自炊の統計とカレンダーを表示する関数"""
+    
+    # 日付データの抽出（YYYY-MM-DD形式のリストを作成）
+    cooked_dates = set()
+    today = datetime.date.today()
+    this_month_count = 0
+    
+    for r in recipes:
+        # created_at は "2023-12-25T12:00:00..." 形式
+        dt = datetime.datetime.fromisoformat(r['created_at']).date()
+        cooked_dates.add(dt)
+        if dt.year == today.year and dt.month == today.month:
+            this_month_count += 1
+            
+    # ストリーク計算（今日から遡って連続何日やっているか）
+    streak = 0
+    check_date = today
+    while check_date in cooked_dates:
+        streak += 1
+        check_date -= datetime.timedelta(days=1)
+    
+    # --- 統計表示エリア ---
+    col1, col2, col3 = st.columns(3)
+    col1.metric("📅 今月の自炊回数", f"{this_month_count} 回")
+    col2.metric("🔥 現在の連続記録", f"{streak} 日")
+    col3.metric("🏆 通算レシピ数", f"{len(recipes)} 品")
+    
+    st.markdown("---")
+    
+    # --- カレンダー表示エリア ---
+    st.subheader(f"📅 {today.year}年 {today.month}月の記録")
+    
+    # カレンダーの作成
+    cal = calendar.monthcalendar(today.year, today.month)
+    
+    # 曜日ヘッダー
+    cols = st.columns(7)
+    weeks = ["月", "火", "水", "木", "金", "土", "日"]
+    for i, w in enumerate(weeks):
+        cols[i].write(f"**{w}**")
+        
+    # 日付埋め込み
+    for week in cal:
+        cols = st.columns(7)
+        for i, day in enumerate(week):
+            if day == 0:
+                cols[i].write("") # 空白
+            else:
+                # その日に料理したかチェック
+                current_date = datetime.date(today.year, today.month, day)
+                if current_date in cooked_dates:
+                    # 料理した日は目立たせる
+                    cols[i].markdown(f"**{day}**<br>🍳", unsafe_allow_html=True)
+                else:
+                    cols[i].write(f"{day}")
 
 # PDF生成
 def create_pdf_bytes(data):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     font_path = "ipaexg.ttf" 
-    try:
-        pdfmetrics.registerFont(TTFont('JapaneseFont', font_path))
+    try: pdfmetrics.registerFont(TTFont('JapaneseFont', font_path))
     except: return None
     styles = getSampleStyleSheet()
     story = [Paragraph(data['title'], ParagraphStyle(name='Title', fontName='JapaneseFont', fontSize=20))]
@@ -148,36 +194,32 @@ def create_pdf_bytes(data):
     buffer.seek(0)
     return buffer
 
-# --- 5. 画面制御 ---
+# --- 5. メイン画面制御 ---
 def main():
     st.set_page_config(page_title="My Recipe Log", page_icon="🍳")
     init_session()
 
-    # 未ログイン時
     if st.session_state['user'] is None:
         st.title("🍳 Recipe Log - ログイン")
         tab1, tab2 = st.tabs(["ログイン", "新規登録"])
         with tab1:
-            email = st.text_input("メールアドレス", key="l_mail")
+            email = st.text_input("メール", key="l_mail")
             password = st.text_input("パスワード", type="password", key="l_pass")
             if st.button("ログイン", type="primary"): login_user(email, password)
         with tab2:
-            st.warning("テスト運用中です。")
-            new_email = st.text_input("メールアドレス", key="s_mail")
-            new_password = st.text_input("パスワード(6文字以上)", type="password", key="s_pass")
-            if st.button("アカウント作成"): signup_user(new_email, new_password)
+            st.warning("テスト運用中")
+            new_email = st.text_input("メール", key="s_mail")
+            new_password = st.text_input("パスワード", type="password", key="s_pass")
+            if st.button("登録"): signup_user(new_email, new_password)
         return
 
-    # ログイン済みメイン画面
     with st.sidebar:
         st.write(f"User: {st.session_state['user'].email}")
         if st.button("ログアウト"): logout_user()
 
     st.title("🍳 自炊サポート & ログ")
-    # タブを3つに増やしました
     tab_create, tab_log, tab_public = st.tabs(["📝 レシピ作成", "📚 自分のレシピ帳", "🌏 みんなの広場"])
 
-    # タブ1: レシピ作成
     with tab_create:
         col1, col2 = st.columns([1, 2])
         with col1:
@@ -187,8 +229,7 @@ def main():
             user_message = st.text_area("メモ", "お弁当用")
             if st.button("レシピ考案", type="primary"):
                 with st.spinner("AI思考中..."):
-                    recipe = generate_recipe_json(ingredients, mode, condition, user_message)
-                    st.session_state['current_recipe'] = recipe
+                    st.session_state['current_recipe'] = generate_recipe_json(ingredients, mode, condition, user_message)
         
         with col2:
             if 'current_recipe' in st.session_state:
@@ -201,85 +242,66 @@ def main():
                 for idx, s in enumerate(r['steps'], 1): st.write(f"{idx}. {s}")
                 st.markdown("---")
                 
-                # 画像アップロード
                 st.write("### 📸 保存設定")
-                uploaded_file = st.file_uploader("完成写真（任意）", type=['jpg', 'png', 'jpeg'])
-                
-                # ★ここが変わりました：公開スイッチ
-                is_public_check = st.checkbox("みんなの広場に公開する（他のユーザーも見れるようになります）")
+                uploaded_file = st.file_uploader("完成写真", type=['jpg', 'png', 'jpeg'])
+                is_public_check = st.checkbox("みんなの広場に公開する")
                 
                 if st.button("💾 ログに保存"):
                     user_id = st.session_state['user'].id
                     image_url = None
                     if uploaded_file:
-                        with st.spinner("画像をアップロード中..."):
-                            image_url = upload_image(uploaded_file, user_id)
+                        image_url = upload_image(uploaded_file, user_id)
                     
-                    # 公開設定も含めて保存
                     if save_recipe_to_db(r, user_message, user_id, image_url, is_public_check):
-                        if is_public_check:
-                            st.success("公開状態で保存しました！みんなに見てもらえます！")
-                        else:
-                            st.success("自分だけのログとして保存しました。")
+                        st.success("保存しました！")
 
                 pdf = create_pdf_bytes(r)
                 if pdf: st.download_button("PDF保存", pdf, "recipe.pdf", "application/pdf")
 
-    # タブ2: 自分のログ
+    # --- カレンダー機能追加エリア ---
     with tab_log:
-        st.header("📚 あなたの料理ログ")
+        st.header("📊 あなたの自炊記録")
         if st.button("更新", key="refresh_my"): st.rerun()
         
-        my_recipes = get_my_recipes(st.session_state['user'].id)
+        user_id = st.session_state['user'].id
+        my_recipes = get_my_recipes(user_id)
+        
+        # ★ここで統計とカレンダーを表示
         if my_recipes:
+            display_stats_and_calendar(my_recipes)
+            st.markdown("---")
+            st.subheader("📚 履歴リスト")
             for r in my_recipes:
                 date_str = r['created_at'].split('T')[0]
-                status = "🌏 公開中" if r['is_public'] else "🔒 自分のみ"
+                status = "🌏 公開" if r['is_public'] else "🔒 非公開"
                 with st.expander(f"{date_str} : {r['title']} ({status})"):
                     if r.get('image_url'): st.image(r['image_url'], use_container_width=True)
                     st.write(f"**メモ:** {r['comment']}")
                     st.json(r['content'])
         else:
-            st.info("保存されたレシピはまだありません。")
+            st.info("まだ記録がありません。レシピを作って保存してみましょう！")
 
-    # タブ3: みんなの広場（新機能！）
     with tab_public:
         st.header("🌏 みんなのレシピ広場")
-        st.markdown("他のユーザーが公開した自炊記録です。今晩の献立の参考に！")
         if st.button("更新", key="refresh_pub"): st.rerun()
-
         public_recipes = get_public_recipes()
-        
-        # ギャラリー風に表示（2列レイアウト）
         if public_recipes:
-            cols = st.columns(2) # 2列にする
+            cols = st.columns(2)
             for idx, r in enumerate(public_recipes):
-                with cols[idx % 2]: # 左右に振り分け
-                    with st.container(border=True): # 枠で囲む
-                        # 画像があれば表示
-                        if r.get('image_url'):
-                            st.image(r['image_url'], use_container_width=True)
-                        else:
-                            st.markdown("🍳 *No Image*")
-                        
+                with cols[idx % 2]:
+                    with st.container(border=True):
+                        if r.get('image_url'): st.image(r['image_url'], use_container_width=True)
+                        else: st.markdown("🍳 *No Image*")
                         st.subheader(r['title'])
-                        st.caption(f"投稿日: {r['created_at'].split('T')[0]}")
-                        st.write(f"💬 {r['comment']}")
-                        
-                        # 中身を見るボタン（詳細展開）
-                        with st.expander("レシピを見る"):
-                            content = r['content']
-                            st.write("**材料:**")
-                            for item in content['ingredients']:
-                                st.write(f"- {item['name']} {item['amount']}")
-                            st.write("**手順:**")
-                            for i, s in enumerate(content['steps'], 1):
-                                st.write(f"{i}. {s}")
+                        st.caption(f"{r['created_at'].split('T')[0]}")
+                        with st.expander("詳細"):
+                            st.json(r['content'])
         else:
-            st.info("まだ公開されたレシピはありません。あなたが最初の投稿者になりましょう！")
+            st.info("公開レシピはまだありません。")
 
 if __name__ == "__main__":
     main()
+
 
 
 
