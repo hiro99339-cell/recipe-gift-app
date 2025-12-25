@@ -1,6 +1,7 @@
 import streamlit as st
 import json
 import io
+import uuid
 from openai import OpenAI
 from supabase import create_client, Client
 from reportlab.pdfgen import canvas
@@ -8,7 +9,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
@@ -24,39 +25,63 @@ supabase: Client = create_client(supabase_url, supabase_key)
 PRIMARY_COLOR = colors.HexColor("#E67E22")
 TEXT_COLOR = colors.HexColor("#2C3E50")
 
-# --- 2. 認証関係の関数 (新機能) ---
+# --- 2. 認証関係 ---
 def init_session():
-    """セッションの初期化"""
     if 'user' not in st.session_state:
         st.session_state['user'] = None
 
 def login_user(email, password):
-    """ログイン処理"""
     try:
         response = supabase.auth.sign_in_with_password({"email": email, "password": password})
         st.session_state['user'] = response.user
         st.success("ログインしました！")
         st.rerun()
     except Exception as e:
-        st.error(f"ログインエラー: メールアドレスかパスワードが間違っています。")
+        st.error("ログインエラー: メールまたはパスワードが違います。")
 
 def signup_user(email, password):
-    """新規登録処理"""
     try:
         response = supabase.auth.sign_up({"email": email, "password": password})
         st.session_state['user'] = response.user
-        st.success("アカウント作成成功！自動的にログインします。")
+        st.success("登録成功！自動ログインします。")
         st.rerun()
     except Exception as e:
         st.error(f"登録エラー: {e}")
 
 def logout_user():
-    """ログアウト処理"""
     supabase.auth.sign_out()
     st.session_state['user'] = None
     st.rerun()
 
-# --- 3. アプリのメイン機能（AI & DB） ---
+# --- 3. 画像アップロード関数 (新機能) ---
+def upload_image(uploaded_file, user_id):
+    """画像をSupabase StorageにアップロードしてURLを返す"""
+    if uploaded_file is None:
+        return None
+    
+    try:
+        # ファイル名をユニークにする（user_id + uuid + 元の拡張子）
+        file_ext = uploaded_file.name.split('.')[-1]
+        file_name = f"{user_id}/{str(uuid.uuid4())}.{file_ext}"
+        
+        # バイトデータを取得
+        file_bytes = uploaded_file.getvalue()
+        
+        # Upload
+        supabase.storage.from_("recipe_images").upload(
+            file_name,
+            file_bytes,
+            {"content-type": uploaded_file.type}
+        )
+        
+        # 公開URLを取得
+        public_url = supabase.storage.from_("recipe_images").get_public_url(file_name)
+        return public_url
+    except Exception as e:
+        st.error(f"画像アップロードエラー: {e}")
+        return None
+
+# --- 4. メイン機能 ---
 
 def generate_recipe_json(ingredients, mode, condition, user_message):
     prompt = f"""
@@ -87,14 +112,15 @@ def generate_recipe_json(ingredients, mode, condition, user_message):
     )
     return json.loads(response.choices[0].message.content)
 
-def save_recipe_to_db(recipe_data, user_comment, user_id):
-    """レシピを保存（ユーザーID付き）"""
+def save_recipe_to_db(recipe_data, user_comment, user_id, image_url=None):
+    """レシピを保存（画像URL対応）"""
     try:
         data = {
-            "user_id": user_id,  # 誰のデータか記録
+            "user_id": user_id,
             "title": recipe_data["title"],
             "content": recipe_data,
-            "comment": user_comment
+            "comment": user_comment,
+            "image_url": image_url # 画像URLも保存
         }
         supabase.table("recipes").insert(data).execute()
         return True
@@ -103,15 +129,13 @@ def save_recipe_to_db(recipe_data, user_comment, user_id):
         return False
 
 def get_my_recipes(user_id):
-    """自分のレシピだけを取得"""
     try:
-        # .eq("user_id", user_id) で自分のデータだけフィルターする
         response = supabase.table("recipes").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
         return response.data
     except Exception as e:
         return []
 
-# PDF生成関数（簡略版）
+# PDF生成 (画像対応)
 def create_pdf_bytes(data):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
@@ -126,7 +150,6 @@ def create_pdf_bytes(data):
     story.append(Paragraph("■材料", ParagraphStyle(name='H1', fontName='JapaneseFont', fontSize=14)))
     for item in data['ingredients']:
         story.append(Paragraph(f"・{item['name']} : {item['amount']}", ParagraphStyle(name='Body', fontName='JapaneseFont')))
-    story.append(Spacer(1, 5*mm))
     story.append(Paragraph("■作り方", ParagraphStyle(name='H1', fontName='JapaneseFont', fontSize=14)))
     for i, step in enumerate(data['steps'], 1):
         story.append(Paragraph(f"{i}. {step}", ParagraphStyle(name='Body', fontName='JapaneseFont')))
@@ -134,43 +157,35 @@ def create_pdf_bytes(data):
     buffer.seek(0)
     return buffer
 
-# --- 4. 画面制御（メイン） ---
+# --- 5. 画面制御 ---
 def main():
     st.set_page_config(page_title="My Recipe Log", page_icon="🍳")
     init_session()
 
-    # --- ログインしていない時 ---
+    # 未ログイン時
     if st.session_state['user'] is None:
         st.title("🍳 Recipe Log - ログイン")
-        st.markdown("自分だけのレシピ帳を作るには、ログインしてください。")
-        
         tab1, tab2 = st.tabs(["ログイン", "新規登録"])
-        
         with tab1:
-            email = st.text_input("メールアドレス", key="login_email")
-            password = st.text_input("パスワード", type="password", key="login_pass")
+            email = st.text_input("メールアドレス", key="l_mail")
+            password = st.text_input("パスワード", type="password", key="l_pass")
             if st.button("ログイン", type="primary"):
                 login_user(email, password)
-        
         with tab2:
-            st.warning("※現在はテスト運用のめ、適当なメールアドレスでも登録できます。")
-            new_email = st.text_input("メールアドレス", key="signup_email")
-            new_password = st.text_input("パスワード（6文字以上）", type="password", key="signup_pass")
+            st.warning("テスト運用中です。")
+            new_email = st.text_input("メールアドレス", key="s_mail")
+            new_password = st.text_input("パスワード(6文字以上)", type="password", key="s_pass")
             if st.button("アカウント作成"):
                 signup_user(new_email, new_password)
-        
-        return  # ここで処理を止める（メイン画面を見せない）
+        return
 
-    # --- ログインしている時（メインアプリ） ---
-    
-    # サイドバーにユーザー情報とログアウトボタン
+    # ログイン済みメイン画面
     with st.sidebar:
-        st.write(f"ログイン中: {st.session_state['user'].email}")
+        st.write(f"User: {st.session_state['user'].email}")
         if st.button("ログアウト"):
             logout_user()
 
     st.title("🍳 自炊サポート & ログ")
-    
     tab_create, tab_log = st.tabs(["📝 レシピ作成", "📚 自分のレシピ帳"])
 
     # タブ1: レシピ作成
@@ -192,46 +207,59 @@ def main():
                 st.subheader(r['title'])
                 st.write(f"⏱ {r['cooking_time']}")
                 
-                # 材料表示
                 st.write("**🛒 材料**")
                 for i in r['ingredients']: st.write(f"- {i['name']} {i['amount']}")
                 
-                # 手順表示
                 st.write("**🍳 手順**")
                 for idx, s in enumerate(r['steps'], 1): st.write(f"{idx}. {s}")
 
                 st.markdown("---")
-                # 保存ボタン（ユーザーIDを渡す！）
-                if st.button("💾 自分のログに保存"):
+                st.write("### 📸 料理の写真を記録する")
+                
+                # 画像アップロード機能
+                uploaded_file = st.file_uploader("完成した料理の写真をアップロード", type=['jpg', 'png', 'jpeg'])
+                
+                if st.button("💾 ログに保存"):
                     user_id = st.session_state['user'].id
-                    if save_recipe_to_db(r, user_message, user_id):
-                        st.success("保存しました！")
+                    
+                    # 画像アップロード処理
+                    image_url = None
+                    if uploaded_file:
+                        with st.spinner("画像をアップロード中..."):
+                            image_url = upload_image(uploaded_file, user_id)
+                    
+                    # DB保存
+                    if save_recipe_to_db(r, user_message, user_id, image_url):
+                        st.success("画像付きで保存しました！")
                 
                 # PDF
                 pdf = create_pdf_bytes(r)
                 if pdf: st.download_button("PDF保存", pdf, "recipe.pdf", "application/pdf")
 
-    # タブ2: ログ閲覧（自分のデータだけ！）
+    # タブ2: ログ閲覧
     with tab_log:
         st.header("📚 あなたの料理ログ")
         if st.button("更新"): st.rerun()
         
-        # 自分のIDでフィルタリングして取得
         user_id = st.session_state['user'].id
         my_recipes = get_my_recipes(user_id)
         
         if my_recipes:
             for r in my_recipes:
-                # 日付変換
                 date_str = r['created_at'].split('T')[0]
                 with st.expander(f"{date_str} : {r['title']}"):
-                    st.write(f"メモ: {r['comment']}")
-                    st.json(r['content']) # 詳細データ
+                    # 画像があれば表示
+                    if r.get('image_url'):
+                        st.image(r['image_url'], caption="作った料理", use_container_width=True)
+                    
+                    st.write(f"**メモ:** {r['comment']}")
+                    st.json(r['content'])
         else:
             st.info("保存されたレシピはまだありません。")
 
 if __name__ == "__main__":
     main()
+
 
 
 
